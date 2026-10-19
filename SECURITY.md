@@ -169,7 +169,7 @@ We believe in recognizing security researchers who help keep Stalwart secure:
 
 ## Additional Resources
 
-- [Stalwart Security Incident Response Process](SECURITY_PROCESS.md)
+- [Stalwart Security Incident Response Process](docs/SECURITY_PROCESS.md)
 - [Security Configuration Guide](https://stalw.art/docs/install/security)
 - [Rust Security Advisory Database](https://rustsec.org/)
 
