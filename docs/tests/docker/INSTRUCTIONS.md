@@ -3,10 +3,12 @@
 Ephemeral Docker Compose stack for testing Stalwart against external services.
 All data is lost on `docker compose down` – every restart is a clean slate.
 
+The Compose file lives at [`tests/docker/docker-compose.yml`](../../../tests/docker/docker-compose.yml); run the commands below from that directory.
+
 ## Quick Start
 
 ```bash
-cd stalwart-test
+cd tests/docker
 docker compose up -d
 ```
 
@@ -151,9 +153,9 @@ to add challenge-specific records (TXT for DNS-01, HTTP tokens, etc.).
 When Pebble validates an HTTP-01 or TLS-ALPN-01 challenge, it:
 
 1. Resolves the domain via challtestsrv — by default all domains resolve to the Docker host
-2. Connects to the resolved IP on port **5002** (HTTP-01) or **5001** (TLS-ALPN-01)
+2. Connects to the resolved IP on port **8898** (HTTP-01) or **8899** (TLS-ALPN-01)
 
-These ports are configured in `pebble/pebble-config.json` (`httpPort` / `tlsPort`).
+These ports are configured in [`pebble/pebble-config.json`](../../../tests/docker/pebble/pebble-config.json) (`httpPort` / `tlsPort`).
 Change them to match whatever port your test Stalwart instance listens on.
 
 #### Management API Examples
