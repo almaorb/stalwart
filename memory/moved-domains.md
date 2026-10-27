@@ -4,7 +4,7 @@ Marco, 2026-10-26: "migrate info and marco from the VPS to here on actionagent.a
 "hotelnative.com also needs emails". Both domains now live on the Mac Stalwart; the VPS
 (almaorb.dev, 0.16.16) is their edge, exactly like learnvibe.ai (`phase-2-vps-edge.md`).
 
-Still on the VPS: dishorb.com, luxura.ai (and the stray local `almaorb.com`, whose real mail is
+Still on the VPS: (dishorb.com and luxura.ai moved 2026-10-27, below) the stray local `almaorb.com`, whose real mail is
 Google Workspace — never touch almaorb.com / myhoma.com / regulusys.com mail DNS). Full move:
 `move-all-mail-to-the-mac.md`.
 
@@ -74,3 +74,18 @@ Per domain, in this order:
    swapped, or forward from Hub).
 3. Optional: remove the Mac domain/accounts and the added DKIM TXT records (old records were never
    changed).
+
+## dishorb.com and luxura.ai (2026-10-27 01:45)
+
+Marco: "yes, move dishorb.com and luxura.ai mail and fix luxura.ai DNS". Same procedure:
+backup `~/srv/stalwart/backups/vps-config-202610270145.json`; `--prepare` (Mac selectors
+`v1-{ed25519,rsa}-20261027` added in Cloudflare); copied info@dishorb.com 1, marco@dishorb.com 4
+(Drafts), marco@luxura.ai 4 (2 INBOX, 2 Junk), counts equal, delta 0; route list now
+`learnvibe.ai actionagent.ai hotelnative.com hotelnative.ai dishorb.com luxura.ai` + VPS restart.
+Inbound via VPS port 25 landed in INBOX on the Mac; outbound from both to Gmail delivered (VPS log).
+Mailboxes added to Hub. luxura.ai DNS: `v1-ed25519-20260909._domainkey` held the DMARC text; it
+now has the VPS's real ed25519 key, and the missing `v1-rsa-20260909._domainkey` was added (both
+from the VPS dnsZoneFile). Known: postmaster@luxura.ai exists only on the Mac, so the VPS refuses it
+at RCPT (DMARC reports go to marco@luxura.ai, unaffected).
+
+Still on the VPS only: the stray local `almaorb.com` (Google Workspace; VPS admin login lives there).
