@@ -21,7 +21,14 @@ Usage:
   migrate-mailboxes.py info@actionagent.ai marco@actionagent.ai
   migrate-mailboxes.py --verify info@actionagent.ai   # counts source vs Mac per folder
 
-Accounts, domains and DKIM are not made here: see memory/move-all-mail-to-the-mac.md.
+  migrate-mailboxes.py --prepare dishorb.com          # Mac domain + accounts + postmaster@ + DKIM TXT
+  migrate-mailboxes.py --prepare --dry-run dishorb.com # what --prepare would do
+
+--prepare (per domain, idempotent): creates the domain on the Mac (DKIM automatic), every VPS user
+account of that domain with a NEW password (Keychain stalwart-<address>; the VPS password is masked by
+the server and is never read or changed), the VPS aliases, postmaster@ on info@ (else the first
+mailbox), and ADDS the Mac's DKIM selectors to Cloudflare (existing records are never changed).
+The inbound switch is separate: scripts/vps-route-to-mac.py + a VPS restart (runbook).
 Secrets are never printed.
 """
 import argparse
@@ -197,6 +204,121 @@ def folder_map(src_list, dst_list):
     return out
 
 
+def mac_jmap(calls):
+    login, pw = mac_admin()
+    body = json.dumps({"using": ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"], "methodCalls": calls}).encode()
+    req = urllib.request.Request(os.environ.get("MAC_JMAP", "http://127.0.0.1:18080/jmap"), data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Basic " + base64.b64encode(f"{login}:{pw}".encode()).decode()})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return {t: a for _, a, t in json.loads(r.read())["methodResponses"]}
+
+
+def vps_jmap(calls):
+    pw = keychain("stalwart-vps-admin", "admin")
+    body = json.dumps({"using": ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"], "methodCalls": calls}).encode()
+    req = urllib.request.Request(VPS_JMAP, data=body, method="POST", headers={
+        "Content-Type": "application/json", "Authorization": "Basic " + base64.b64encode(f"admin:{pw}".encode()).decode()})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return {t: a for _, a, t in json.loads(r.read())["methodResponses"]}
+
+
+def query_get(obj, props):
+    return [[f"{obj}/query", {}, "q"], [f"{obj}/get", {"#ids": {"resultOf": "q", "name": f"{obj}/query", "path": "/ids"}, "properties": props}, "g"]]
+
+
+def new_password():
+    import secrets
+    import string
+    alphabet = string.ascii_letters + string.digits + "-_.!"
+    while True:
+        pw = "".join(secrets.choice(alphabet) for _ in range(24))
+        if any(c.isupper() for c in pw) and any(c.islower() for c in pw) and any(c.isdigit() for c in pw):
+            return pw
+
+
+def cloudflare(method, path, body=None):
+    token = keychain("cloudflare-api-token")
+    req = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, method=method,
+                                 data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        return json.loads(e.read() or b"{}")
+
+
+def prepare(domain, dry_run=False):
+    """Mac domain + accounts + aliases + postmaster@ + DKIM TXT in Cloudflare. Idempotent."""
+    if domain in SKIP_DOMAINS:
+        raise SystemExit(f"{domain} is Google Workspace: never moved")
+    out = {"domain": domain, "actions": []}
+    act = out["actions"].append
+    v = vps_jmap(query_get("x:Domain", ["name"]) + [["x:Account/get", {"properties": ["@type", "name", "domainId", "emailAddress", "aliases"]}, "a"]])
+    vdom = {d["id"]: d["name"] for d in v["g"]["list"]}
+    users = [a for a in v["a"]["list"] if a.get("@type") == "User" and (a.get("emailAddress") or "").endswith("@" + domain)]
+    m = mac_jmap(query_get("x:Domain", ["name"]))
+    mac_dom = {d["name"]: d["id"] for d in m["g"]["list"]}
+    if domain not in mac_dom:
+        act(f"create domain {domain} on the Mac (DKIM automatic)")
+        if not dry_run:
+            r = mac_jmap([["x:Domain/set", {"create": {"d": {"name": domain, "enable": True, "reportAddressUri": "mailto:postmaster",
+                "dkimManagement": {"@type": "Automatic", "algorithms": {"Dkim1Ed25519Sha256": True, "Dkim1RsaSha256": True},
+                                   "selectorTemplate": "v{version}-{algorithm}-{date-%Y%m%d}", "rotateAfter": 7776000000,
+                                   "retireAfter": 604800000, "deleteAfter": 2592000000}}}}, "d"]])
+            mac_dom[domain] = r["d"]["created"]["d"]["id"]
+    did = mac_dom.get(domain, "<new>")
+    mac_accounts = mac_jmap(query_get("x:Account", ["emailAddress", "aliases"]))["g"]["list"]
+    have = {a["emailAddress"].lower() for a in mac_accounts if a.get("emailAddress")}
+    has_postmaster = any(al.get("name") == "postmaster" and al.get("domainId") == did for a in mac_accounts for al in (a.get("aliases") or {}).values())
+    postmaster_on = None if has_postmaster else ("info@" + domain if any(u["emailAddress"].lower() == "info@" + domain for u in users) else (users[0]["emailAddress"].lower() if users else None))
+    for u in users:
+        addr = u["emailAddress"].lower()
+        aliases = [(al["name"], vdom.get(al["domainId"])) for al in (u.get("aliases") or {}).values()]
+        aliases = [(n, d) for n, d in aliases if d == domain]
+        if addr == postmaster_on:
+            aliases.append(("postmaster", domain))
+        if addr in have:
+            act(f"{addr}: already on the Mac")
+            continue
+        act(f"create {addr} (new password → Keychain stalwart-{addr})" + (f", aliases {', '.join(n + '@' + d for n, d in aliases)}" if aliases else ""))
+        if dry_run:
+            continue
+        svc = f"stalwart-{addr}"
+        if keychain(svc, addr) is None:
+            subprocess.run(["security", "add-generic-password", "-s", svc, "-a", addr, "-j", f"Mac Stalwart mailbox ({domain} moved from the VPS)", "-w", new_password()], check=True)
+        pw = keychain(svc, addr)
+        acct = {"@type": "User", "name": addr.split("@")[0], "domainId": did, "roles": {"@type": "User"}, "description": addr,
+                "credentials": {"0": {"@type": "Password", "secret": pw}},
+                "aliases": {str(i): {"enable": True, "name": n, "domainId": did, "description": None} for i, (n, _) in enumerate(aliases)}}
+        r = mac_jmap([["x:Account/set", {"create": {"a": acct}}, "a"]])
+        if "created" not in r["a"] or "a" not in r["a"]["created"]:
+            raise RuntimeError(f"creating {addr} failed: {r['a'].get('notCreated')}")
+    # DKIM: add the Mac's selectors (never touch existing records).
+    zone = mac_jmap([["x:Domain/get", {"ids": [did], "properties": ["dnsZoneFile"]}, "z"]])["z"]["list"] if did != "<new>" else []
+    zone_file = zone[0]["dnsZoneFile"] if zone else ""
+    recs = re.findall(r"^(\S+_domainkey\." + re.escape(domain) + r")\. IN TXT (\(.*?\)|\"[^\"]*\")", zone_file, re.S | re.M)
+    z = cloudflare("GET", f"/zones?name={domain}")["result"]
+    if not z:
+        act(f"no Cloudflare zone for {domain}: add the DKIM records by hand")
+        return out
+    zid = z[0]["id"]
+    existing = {r["name"] for r in cloudflare("GET", f"/zones/{zid}/dns_records?per_page=5000")["result"] if r["type"] == "TXT"}
+    if did == "<new>":
+        act("add the Mac's DKIM selectors to Cloudflare (known after the domain exists)")
+    for name, val in recs:
+        if name in existing:
+            act(f"DKIM {name}: already in Cloudflare")
+            continue
+        act(f"add TXT {name} to Cloudflare")
+        if not dry_run:
+            content = "".join(re.findall(r'"([^"]*)"', val))
+            r = cloudflare("POST", f"/zones/{zid}/dns_records", {"type": "TXT", "name": name, "content": content, "ttl": 1, "comment": f"Mac Stalwart DKIM ({domain})"})
+            if not r.get("success"):
+                raise RuntimeError(f"Cloudflare refused {name}: {r.get('errors')}")
+    return out
+
+
 def migrate(address, dry_run=False, verify=False):
     src = connect_vps(address)
     src_list = parse_list(src.list()[1])
@@ -289,7 +411,12 @@ def main():
     ap.add_argument("--all", action="store_true", help="every user mailbox on the VPS (Google Workspace domains left out)")
     ap.add_argument("--dry-run", action="store_true", help="count only; write nothing")
     ap.add_argument("--verify", action="store_true", help="source vs Mac counts per folder")
+    ap.add_argument("--prepare", action="store_true", help="arguments are domains: make them ready on the Mac")
     args = ap.parse_args()
+    if args.prepare:
+        for d in args.addresses:
+            print(json.dumps(prepare(d.lower(), dry_run=args.dry_run)))
+        return
     addresses = [a.lower() for a in args.addresses] or (vps_accounts() if args.all else [])
     if not addresses:
         ap.error("name addresses or --all")
