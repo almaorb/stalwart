@@ -9,6 +9,8 @@
 #![warn(clippy::cast_possible_wrap)]
 #![warn(clippy::cast_sign_loss)]
 
+#[cfg(target_os = "linux")]
+use common::manager::systemd::ServiceState;
 use common::{BuildServer, config::server::ServerProtocol, manager::boot::BootManager};
 use http::HttpSessionManager;
 use imap::core::ImapSessionManager;
@@ -16,10 +18,19 @@ use managesieve::core::ManageSieveSessionManager;
 use pop3::Pop3SessionManager;
 use services::{StartServices, broadcast::subscriber::spawn_broadcast_subscriber};
 use smtp::{StartQueueManager, core::SmtpSessionManager};
-use std::time::Duration;
+use std::{process::ExitCode, time::Duration};
 use trc::Collector;
-use utils::wait_for_shutdown;
+use utils::{
+    runtime::{exit, run_server},
+    wait_for_shutdown,
+};
 
+#[cfg(all(
+    target_arch = "x86_64",
+    target_feature = "sse4.2",
+    any(target_os = "linux", target_os = "freebsd")
+))]
+mod cpu;
 #[cfg(feature = "dev_mode")]
 pub mod test_data;
 
@@ -30,8 +41,11 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<ExitCode> {
+    run_server(async_main())
+}
+
+async fn async_main() -> ExitCode {
     // Install AWS-LC-RS as the default Rustls crypto provider
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
@@ -40,17 +54,21 @@ async fn main() -> std::io::Result<()> {
     // Build the shared outbound TLS configurations
     utils::http::init_shared_tls_configs();
 
-    // Load config and apply macros
-    let mut init = Box::pin(BootManager::init()).await;
+    // Prepare the archive compression dictionaries
+    store::write::compress::init();
 
-    // Migrate database
-    if let Err(err) = migration::try_migrate(&init.inner.build_server()).await {
+    // Load config and apply macros
+    let mut init = BootManager::init().await;
+
+    // Verify database schema version
+    if let Err(err) = init.inner.build_server().verify_schema_version().await {
+        eprintln!("{err}");
         trc::event!(
             Server(trc::ServerEvent::StartupError),
-            Details = "Failed to migrate database, aborting startup.",
+            Details = "Unsupported database schema version, aborting startup.",
             Reason = err,
         );
-        return Ok(());
+        return ExitCode::FAILURE;
     }
 
     // Init services
@@ -73,6 +91,7 @@ async fn main() -> std::io::Result<()> {
     if std::env::var("INSERT_TEST_DATA").is_ok() {
         let server = init.inner.build_server();
         test_data::insert_test_data(&server).await;
+        #[cfg(feature = "enterprise")]
         server.insert_test_metrics().await;
     }
 
@@ -113,19 +132,29 @@ async fn main() -> std::io::Result<()> {
     });
 
     // Start broadcast subscriber
+    let inner = init.inner.clone();
     spawn_broadcast_subscriber(init.inner, shutdown_rx);
+
+    #[cfg(target_os = "linux")]
+    ServiceState::Ready.notify();
 
     // Wait for shutdown signal
     wait_for_shutdown().await;
 
-    // Shutdown collector
-    Collector::shutdown();
+    #[cfg(target_os = "linux")]
+    ServiceState::Stopping.notify();
 
     // Stop services
     let _ = shutdown_tx.send(true);
 
+    // Persist the newest cache snapshots before the process exits
+    inner.cache.swap.stop().await;
+
+    // Shutdown collector
+    Collector::shutdown();
+
     // Wait for services to finish
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    Ok(())
+    exit(0);
 }

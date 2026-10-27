@@ -95,6 +95,8 @@ Environment variables read by the server (names only):
 
 ## Test
 
+> **Since `v1.0.0`** the `tests/` crate, its Docker stack and `.github/workflows/test.yml` are gone upstream (test suites moved to a private repository). What follows describes `v0.16.23`. On `v1.0.0` run the crate unit tests, e.g. `cargo test --release -p jmap_proto -p imap_proto -p smtp-proto -p sieve -p calcard` (see `memory/stalwart-on-the-mac.md`).
+
 The test workflow (`.github/workflows/test.yml`, manually dispatched) runs:
 
 ```sh

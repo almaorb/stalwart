@@ -33,8 +33,9 @@ A security audit report is published at https://stalw.art/blog/security-audit.
 
 ## Status
 
-- Current version on this branch: **0.16.23** (`crates/main/Cargo.toml`), tagged `v0.16.23` on 2026-09-21.
-- Pre-1.0. The previous README described the project as *feature complete*; the stated next milestone is finalizing the database schema and performance work before **1.0**.
+- Current version on this branch: **1.0.0** (`crates/main/Cargo.toml`), upstream tag `v1.0.0` (2026-10-26). The AlmaOrb fork was rebased onto it on 2026-10-26; the previous fork head (on `v0.16.23`) is tagged `pre-update-2026-10-26`. The analysis documents in this folder (VISION, ARCHITECTURE, DEVELOPMENT, HISTORY) were written against `v0.16.23`; where they disagree with the code, the code wins.
+- `v1.0.0` introduced a new database layout and settings schema: `v0.16.x` data cannot be upgraded in place (see the 1.0.0 entry in [`CHANGELOG.md`](../CHANGELOG.md) and https://stalw.art/docs/migration/upgrade-0-16/). Upstream also moved its test suites (the old `tests/` crate) to a private repository; only crate-level unit tests remain here.
+- How the AlmaOrb deployment runs on the Mac, and how to update from upstream: [`../memory/README.md`](../memory/README.md).
 - `v0.16` replaced the TOML configuration and REST API with a small on-disk `config.json` plus configuration stored as JMAP objects in the datastore. Upgrades from `v0.15.x` and earlier require the migration in [`UPGRADING/v0_16.md`](../UPGRADING/v0_16.md).
 - Contributions are limited to vouched contributors, and at this stage only bug fixes and translations are accepted. See [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 
@@ -85,7 +86,6 @@ When no configuration file exists yet the server starts in bootstrap mode and op
 | [HISTORY.md](HISTORY.md) | Origins, authors and milestones from the git log. |
 | [SECURITY_PROCESS.md](SECURITY_PROCESS.md) | Internal checklist for handling a security incident. |
 | [SECURITY_TEMPLATE.md](SECURITY_TEMPLATE.md) | Template for publishing a security advisory. |
-| [tests/docker/INSTRUCTIONS.md](tests/docker/INSTRUCTIONS.md) | Docker Compose stack of external services for testing. |
 
 Kept at the repository root because tooling, GitHub, or links printed by shipped binaries refer to them by path:
 

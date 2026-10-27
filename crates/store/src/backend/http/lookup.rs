@@ -4,20 +4,18 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use std::{
-    io::{BufRead, BufReader},
-    sync::{Arc, atomic::Ordering},
-    time::Instant,
-};
-
+use super::{HttpStore, HttpStoreConfig};
+use crate::{Value, backend::http::HttpStoreFormat, write::now};
 use ahash::AHashMap;
 use compact_str::ToCompactString;
 use rand::seq::IndexedRandom;
+use std::{
+    borrow::Cow,
+    io::{self, BufRead, BufReader, Read},
+    sync::{Arc, atomic::Ordering},
+    time::Instant,
+};
 use utils::HttpLimitResponse;
-
-use crate::{Value, backend::http::HttpStoreFormat, write::now};
-
-use super::HttpStore;
 
 const BROWSER_USER_AGENTS: [&str; 5] = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -36,11 +34,11 @@ pub(crate) trait HttpStoreGet {
 impl HttpStoreGet for Arc<HttpStore> {
     fn get(&self, key: &str) -> Option<Value<'static>> {
         self.refresh();
-        self.entries.load().get(key).cloned()
+        self.entries.load().get(lookup_key(key).as_ref()).cloned()
     }
 
     fn contains(&self, key: &str) -> bool {
-        #[cfg(feature = "test_mode")]
+        #[cfg(stalwart_tests)]
         {
             if self.config.url.contains("phishtank.com")
                 || self.config.url.contains("openphish.com")
@@ -59,7 +57,7 @@ impl HttpStoreGet for Arc<HttpStore> {
         }
 
         self.refresh();
-        self.entries.load().contains_key(key)
+        self.entries.load().contains_key(lookup_key(key).as_ref())
     }
 
     fn refresh(&self) {
@@ -71,7 +69,7 @@ impl HttpStoreGet for Arc<HttpStore> {
                     let expires = match this.try_refresh().await {
                         Ok(list) => {
                             this.entries.store(list.into());
-                            this.config.refresh
+                            this.config.refresh_interval
                         }
                         Err(err) => {
                             trc::error!(err);
@@ -90,21 +88,22 @@ impl HttpStoreGet for Arc<HttpStore> {
 impl HttpStore {
     async fn try_refresh(&self) -> trc::Result<AHashMap<String, Value<'static>>> {
         let time = Instant::now();
-        let agent = BROWSER_USER_AGENTS.choose(&mut rand::rng()).unwrap();
-        let response = self
+        let mut request = self
             .client
             .get(&self.config.url)
-            .timeout(self.config.timeout)
-            .header(reqwest::header::USER_AGENT, *agent)
-            .send()
-            .await
-            .map_err(|err| {
-                trc::StoreEvent::HttpStoreError
-                    .into_err()
-                    .reason(err)
-                    .ctx(trc::Key::Url, self.config.url.to_compact_string())
-                    .details("Failed to build request")
-            })?;
+            .timeout(self.config.timeout);
+        if !self.config.custom_user_agent
+            && let Some(agent) = BROWSER_USER_AGENTS.choose(&mut rand::rng())
+        {
+            request = request.header(reqwest::header::USER_AGENT, *agent);
+        }
+        let response = request.send().await.map_err(|err| {
+            trc::StoreEvent::HttpStoreError
+                .into_err()
+                .reason(err)
+                .ctx(trc::Key::Url, self.config.url.to_compact_string())
+                .details("Failed to build request")
+        })?;
 
         if !response.status().is_success() {
             trc::bail!(
@@ -136,15 +135,16 @@ impl HttpStore {
                     .details("Resource is too large")
             })?;
 
-        let reader: Box<dyn std::io::Read + Sync + Send> = if self.config.gzipped {
+        let reader: Box<dyn Read + Sync + Send> = if self.config.gzipped {
             Box::new(flate2::read::GzDecoder::new(&bytes[..]))
         } else {
             Box::new(&bytes[..])
         };
 
-        let mut entries = AHashMap::new();
-        for (pos, line) in BufReader::new(reader).lines().enumerate() {
-            let line_ = line.map_err(|err| {
+        let entries = self
+            .config
+            .parse_entries(BufReader::new(reader))
+            .map_err(|err| {
                 trc::StoreEvent::HttpStoreError
                     .into_err()
                     .reason(err)
@@ -153,11 +153,39 @@ impl HttpStore {
                     .details("Failed to read line")
             })?;
 
-            match &self.config.format {
+        trc::event!(
+            Store(trc::StoreEvent::HttpStoreFetch),
+            Url = self.config.url.to_compact_string(),
+            Total = entries.len(),
+            Elapsed = time.elapsed(),
+        );
+
+        Ok(entries)
+    }
+}
+
+impl HttpStoreConfig {
+    fn parse_entries(
+        &self,
+        mut reader: impl BufRead,
+    ) -> io::Result<AHashMap<String, Value<'static>>> {
+        let mut entries = AHashMap::new();
+        let mut buf = Vec::new();
+        let mut entry_key = String::new();
+        let mut entry_value = String::new();
+
+        for pos in 0usize.. {
+            let line = match read_line(&mut reader, &mut buf, self.max_size)? {
+                Line::Text(line) => line,
+                Line::Oversize => continue,
+                Line::Eof => break,
+            };
+
+            match &self.format {
                 HttpStoreFormat::List => {
-                    let line = line_.trim();
-                    if !line.is_empty() {
-                        entries.insert(line.to_string(), Value::Integer(1));
+                    let line = line.trim();
+                    if !line.is_empty() && line.len() <= self.max_entry_size {
+                        entries.insert(lookup_key(line).into_owned(), Value::Integer(1));
                     }
                 }
                 HttpStoreFormat::Csv {
@@ -169,11 +197,12 @@ impl HttpStore {
                     let mut in_quote = false;
                     let mut col_num = 0;
                     let mut last_ch = ' ';
+                    let mut oversize = false;
 
-                    let mut entry_key: String = String::new();
-                    let mut entry_value: String = String::new();
+                    entry_key.clear();
+                    entry_value.clear();
 
-                    for ch in line_.chars() {
+                    for ch in line.chars() {
                         match ch {
                             '"' if last_ch != '\\' => {
                                 in_quote = !in_quote;
@@ -188,12 +217,14 @@ impl HttpStore {
                                     }
                                 } else if col_num == *index_key {
                                     entry_key.push(ch);
-                                    if entry_key.len() > self.config.max_entry_size {
+                                    if entry_key.len() > self.max_entry_size {
+                                        oversize = true;
                                         break;
                                     }
                                 } else if index_value.is_some_and(|v| col_num == v) {
                                     entry_value.push(ch);
-                                    if entry_value.len() > self.config.max_entry_size {
+                                    if entry_value.len() > self.max_entry_size {
+                                        oversize = true;
                                         break;
                                     }
                                 }
@@ -203,30 +234,71 @@ impl HttpStore {
                         last_ch = ch;
                     }
 
-                    if !entry_key.is_empty() {
+                    if !oversize && !entry_key.is_empty() {
                         let entry_value = if !entry_value.is_empty() {
-                            Value::Text(entry_value.into())
+                            Value::Text(Cow::Owned(String::from(entry_value.as_str())))
                         } else {
                             Value::Integer(1)
                         };
-                        entries.insert(entry_key, entry_value);
+                        entries.insert(lookup_key(&entry_key).into_owned(), entry_value);
                     }
                 }
                 _ => (),
             }
 
-            if entries.len() == self.config.max_entries {
+            if entries.len() == self.max_entries {
                 break;
             }
         }
 
-        trc::event!(
-            Store(trc::StoreEvent::HttpStoreFetch),
-            Url = self.config.url.to_compact_string(),
-            Total = entries.len(),
-            Elapsed = time.elapsed(),
-        );
-
         Ok(entries)
     }
 }
+
+enum Line<'x> {
+    Text(&'x str),
+    Oversize,
+    Eof,
+}
+
+fn read_line<'x>(
+    reader: &mut impl BufRead,
+    buf: &'x mut Vec<u8>,
+    max_len: usize,
+) -> io::Result<Line<'x>> {
+    buf.clear();
+    let limit = u64::try_from(max_len).unwrap_or(u64::MAX).saturating_add(1);
+    if reader.by_ref().take(limit).read_until(b'\n', buf)? == 0 {
+        return Ok(Line::Eof);
+    }
+    let buf: &'x [u8] = buf;
+    let line = match buf.strip_suffix(b"\n") {
+        Some(line) => line.strip_suffix(b"\r").unwrap_or(line),
+        None if buf.len() > max_len => {
+            reader.skip_until(b'\n')?;
+            return Ok(Line::Oversize);
+        }
+        None => buf,
+    };
+    str::from_utf8(line)
+        .map(Line::Text)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
+}
+
+fn lookup_key(key: &str) -> Cow<'_, str> {
+    let needs_lowercase = if key.is_ascii() {
+        key.bytes().any(|b| b.is_ascii_uppercase())
+    } else {
+        key.chars().any(|ch| !ch.to_lowercase().eq([ch]))
+    };
+    if needs_lowercase {
+        Cow::Owned(key.to_lowercase())
+    } else {
+        Cow::Borrowed(key)
+    }
+}
+
+#[cfg(all(test, stalwart_tests))]
+#[rustfmt::skip]
+#[path = "../../../../../../stalwart-tests/unit/store/src/backend/http/lookup/tests.rs"]
+mod tests;

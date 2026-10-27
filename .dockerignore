@@ -3,8 +3,8 @@
 
 // Allow what is needed
 !crates
-!tests
 !resources
 
+!.cargo
 !Cargo.lock
 !Cargo.toml
