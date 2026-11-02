@@ -90,6 +90,7 @@ direct MX delivery in Stalwart (`get_route_or_default`), so keep the route name 
 | `stalwart-admin` | `admin` | Admin password. Login name is **`admin@learnvibe.ai`** (in the item's comment). Web admin: http://127.0.0.1:18080/admin |
 | `stalwart-info@learnvibe.ai` | `info@learnvibe.ai` | Mailbox |
 | `stalwart-appreview@learnvibe.ai` | `appreview@learnvibe.ai` | Mailbox |
+| `stalwart-hello@dishorb.com` | `hello@dishorb.com` | Dishorb app's sender (2026-11-02, Marco: "use hello@dishorb.com"); the Dishorb server sends via 127.0.0.1:10587 plain AUTH |
 
 Read one: `security find-generic-password -s stalwart-admin -w`.
 
